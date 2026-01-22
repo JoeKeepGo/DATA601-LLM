@@ -2,6 +2,7 @@ import unsloth
 from unsloth import FastLanguageModel
 import os
 import torch
+import torch.nn.functional as F
 import logging
 import sys
 import gc
@@ -26,6 +27,7 @@ WANDB_KEY = "wandb_v1_7J8ubcHuwRuOo9GjlwVipAP6QZK_vZLQzoHQzfADHezw2KRo6zl9tvlk6O
 BASE_DIR = "/home/data601/project"
 MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507" 
 DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train_quality_hybrid_cot.jsonl")
+TEST_DATA_PATH = DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train_quality_hybrid_cot_test.jsonl")
 OUTPUT_DIR = os.path.join(BASE_DIR, "fine_tuned_model", WANDB_RUN_NAME)
 
 # 模型加载参数
@@ -100,6 +102,18 @@ NEFTUNE_NOISE_ALPHA = 10
 # Packing
 PACKING = False
 
+# Loss 计算方式配置
+# 选项:
+# "default" 完全使用 TRL/SFTTrainer 默认 loss
+# "token_micro" 按有效 token 数做 micro-average（sum / #valid_tokens）
+# "sentence_macro" 先每条样本平均，再对 batch 平均（对短样本权重大）
+# "tail_weighted" 对序列尾部 token 加权（后半段更重要）
+LOSS_METHOD = "default"
+
+# 仅当 LOSS_METHOD="tail_weighted" 时生效
+TAIL_WEIGHT = 2.0          # 尾部权重倍数
+TAIL_PORTION = 0.5         # 尾部比例：0.5 表示最后 50% token
+
 # 指标计算函数
 
 # 在 GPU 上直接计算 argmax，避免传输巨大的 Logits 到 CPU，避免计算 Accuracy 产生 OOM
@@ -125,6 +139,84 @@ def compute_metrics(eval_pred):
     accuracy = (preds == labels).mean()
     
     return {"accuracy": accuracy}
+
+
+# 自定义 Loss 计算
+
+class CustomSFTTrainer(SFTTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        # 默认
+        if LOSS_METHOD == "default":
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+
+        outputs = model(**inputs)
+        logits = outputs.logits
+        labels = inputs.get("labels", None)
+        if labels is None:
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+
+        # CausalLM：手动 shift 对齐 logits 与 labels
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        vocab = shift_logits.size(-1)
+
+        # per-token CE（不做 reduction）
+        loss_per_token = F.cross_entropy(
+            shift_logits.view(-1, vocab),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).view_as(shift_labels)
+
+        # 有效 token mask（忽略 -100）
+        mask = (shift_labels != -100).to(loss_per_token.dtype)
+
+        if LOSS_METHOD == "token_micro":
+            denom = mask.sum().clamp_min(1.0)
+            loss = (loss_per_token * mask).sum() / denom
+
+        elif LOSS_METHOD == "sentence_macro":
+            # 每条样本：sum / #valid，再对 batch mean
+            per_seq_sum = (loss_per_token * mask).sum(dim=1)
+            per_seq_cnt = mask.sum(dim=1).clamp_min(1.0)
+            loss = (per_seq_sum / per_seq_cnt).mean()
+
+        elif LOSS_METHOD == "tail_weighted":
+            # 对尾部 token 加权
+            weights = torch.ones_like(loss_per_token)
+            seq_len = weights.size(1)
+            tail_start = int(seq_len * (1.0 - TAIL_PORTION))
+            tail_start = max(0, min(seq_len, tail_start))
+            weights[:, tail_start:] = TAIL_WEIGHT
+
+            weighted = loss_per_token * mask * weights
+            denom = (mask * weights).sum().clamp_min(1.0)
+            loss = weighted.sum() / denom
+
+        else:
+            # 未知配置退回默认
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+
+        return (loss, outputs) if return_outputs else loss
 
 # 训练代码
 def train():
@@ -238,6 +330,23 @@ def train():
     logger.info(f"    Train Samples: {len(train_dataset)}")
     logger.info(f"    Eval Samples:  {len(eval_dataset)}")
 
+
+    # 加载独立 Test 集
+    test_dataset = None
+    if TEST_DATA_PATH:
+        logger.info(f">>> Loading TEST dataset from {TEST_DATA_PATH}")
+        test_dataset = load_dataset("json", data_files=TEST_DATA_PATH, split="train")
+
+        # 如果 test 数据还没格式化为 text，则复用同样的 formatting 函数
+        if DATASET_TEXT_FIELD not in test_dataset.column_names:
+            if "messages" not in test_dataset.column_names:
+                logger.error(f"!!! ERROR: Test dataset missing 'messages' or '{DATASET_TEXT_FIELD}' field.")
+                sys.exit(1)
+            logger.info(">>> Formatting TEST dataset...")
+            test_dataset = test_dataset.map(formatting_prompts_func, batched = DATASET_BATCHED)
+
+        logger.info(f"    Test Samples: {len(test_dataset)}")
+
     # 配置训练器
     logger.info(">>> Initializing Trainer...")
     
@@ -246,7 +355,7 @@ def train():
     if not USE_LORA and final_lr > 5e-5:
         logger.warning(f"WARNING: Learning rate {final_lr} might be too high for Full FT.")
 
-    trainer = SFTTrainer(
+    trainer = CustomSFTTrainer(
         model = model,
         tokenizer = tokenizer,
         train_dataset = train_dataset, 
@@ -280,7 +389,7 @@ def train():
             save_steps = SAVE_STEPS,
             save_total_limit = SAVE_TOTAL_LIMIT,
 
-            # 评估配置 (更新)
+            # 评估配置
             eval_strategy = EVAL_STRATEGY,
             eval_steps = EVAL_STEPS,
             per_device_eval_batch_size = EVAL_BATCH_SIZE,
@@ -337,6 +446,13 @@ def train():
         sys.exit(1)
         
     trainer_stats = trainer.train()
+
+
+    # [New] 训练结束后：对独立 Test 集做最终评估（不参与训练/调参）
+    if test_dataset is not None:
+        logger.info(">>> Running final evaluation on Test set...")
+        test_metrics = trainer.evaluate(eval_dataset=test_dataset)
+        logger.info(f">>> Test metrics: {test_metrics}")
 
     # 保存模型
     logger.info(f">>> Saving model to {OUTPUT_DIR}")
