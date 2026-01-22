@@ -27,7 +27,8 @@ WANDB_KEY = "wandb_v1_7J8ubcHuwRuOo9GjlwVipAP6QZK_vZLQzoHQzfADHezw2KRo6zl9tvlk6O
 BASE_DIR = "/home/data601/project"
 MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507" 
 DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train_quality_hybrid_cot.jsonl")
-TEST_DATA_PATH = DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train_quality_hybrid_cot_test.jsonl")
+# 独立 Test 集路径若为 None 则跳过 Test 评估
+TEST_DATA_PATH = os.path.join(BASE_DIR, "dataset/test/train_quality_hybrid_cot_test.jsonl")
 OUTPUT_DIR = os.path.join(BASE_DIR, "fine_tuned_model", WANDB_RUN_NAME)
 
 # 模型加载参数
@@ -52,7 +53,7 @@ DATASET_TEXT_FIELD = "text"
 ADD_GENERATION_PROMPT = False
 
 # apply_chat_template 是否直接分词
-# 注意: SFTTrainer 通常需要文本输入 (tokenize=False)，除非你自己在外面做完 tokenization
+# 注意: SFTTrainer 通常需要文本输入 (tokenize=False)，除非在外部做完 tokenization
 TEMPLATE_TOKENIZE = False 
 
 # 微调模式
@@ -114,8 +115,13 @@ LOSS_METHOD = "default"
 TAIL_WEIGHT = 2.0          # 尾部权重倍数
 TAIL_PORTION = 0.5         # 尾部比例：0.5 表示最后 50% token
 
-# 指标计算函数
+# Test 结果可视化（WandB）
+ENABLE_WANDB_TEST_TABLE = True # True: 训练结束后在 Test 集抽样生成预测并上传 WandB Table
+WANDB_TEST_TABLE_SAMPLES = 20 # 抽样条数
+WANDB_TEST_MAX_NEW_TOKENS = 2048 # 每条样本生成的最大 token 数
+WANDB_TABLE_TEXT_TRUNCATE = 4096 # 记录到 Table 的文本截断长度（字符数）
 
+# 指标计算函数
 # 在 GPU 上直接计算 argmax，避免传输巨大的 Logits 到 CPU，避免计算 Accuracy 产生 OOM
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
@@ -167,13 +173,13 @@ class CustomSFTTrainer(SFTTrainer):
                 **kwargs,
             )
 
-        # CausalLM：手动 shift 对齐 logits 与 labels
+        # CausalLM
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
 
         vocab = shift_logits.size(-1)
 
-        # per-token CE（不做 reduction）
+        # per-token CE（none reduction）
         loss_per_token = F.cross_entropy(
             shift_logits.view(-1, vocab),
             shift_labels.view(-1),
@@ -363,7 +369,7 @@ def train():
         dataset_text_field = DATASET_TEXT_FIELD,
         max_seq_length = MAX_SEQ_LENGTH,
 
-        # [New] 传入指标计算函数
+        # 传入指标计算函数
         compute_metrics = compute_metrics,
         preprocess_logits_for_metrics = preprocess_logits_for_metrics,
         
@@ -448,24 +454,130 @@ def train():
     trainer_stats = trainer.train()
 
 
-    # [New] 训练结束后：对独立 Test 集做最终评估（不参与训练/调参）
+        # 训练结束后对独立 Test 集做最终评估
     if test_dataset is not None:
         logger.info(">>> Running final evaluation on Test set...")
-        test_metrics = trainer.evaluate(eval_dataset=test_dataset)
+
+        # 获取评估结果
+        test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+
+        # 打印并保存到本地日志
         logger.info(f">>> Test metrics: {test_metrics}")
 
-    # 保存模型
-    logger.info(f">>> Saving model to {OUTPUT_DIR}")
-    model.save_pretrained(OUTPUT_DIR) 
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    
-    logger.info(">>> Training Complete.")
+        # 更新 WandB 的 Summary，确保 Runs 总览面板能看到 test_* 指标
+        if wandb.run is not None:
+            try:
+                wandb.run.summary.update(test_metrics)
+            except Exception as e:
+                logger.warning(f"WandB summary update warning: {e}")
 
-    # 显存清理
-    logger.info(">>> Cleaning up GPU memory...")
-    del model, trainer
-    gc.collect()
-    torch.cuda.empty_cache()
+        # 抽样生成预测并上传 WandB Table
+        # 用 generate（而非 trainer.predict 的全量 logits），避免输出巨大 logits 导致 OOM
+        if ENABLE_WANDB_TEST_TABLE and wandb.run is not None:
+            try:
+                logger.info(">>> Generating predictions for WandB table (sampled)...")
+
+                # 固定抽样
+                n = min(WANDB_TEST_TABLE_SAMPLES, len(test_dataset))
+                sampled = test_dataset.shuffle(seed=RANDOM_SEED).select(range(n))
+
+                table = wandb.Table(columns=["Prompt", "Ground Truth", "Model Output"])
+
+                model.eval()
+                for i in range(n):
+                    row = sampled[i]
+
+                    # 优先从原始 messages 构建 prompt，否则退回 text 字段
+                    prompt = None
+                    gt = None
+
+                    if "messages" in row and row["messages"] is not None:
+                        msgs = row["messages"]
+                        try:
+                            # ground truth：取最后一个 assistant 的内容
+                            last_a = None
+                            for j in range(len(msgs) - 1, -1, -1):
+                                if msgs[j].get("role") == "assistant":
+                                    last_a = j
+                                    break
+                            if last_a is not None:
+                                gt = msgs[last_a].get("content", None)
+                                prompt_msgs = msgs[:last_a]  # 不包含最终 assistant，避免答案泄漏
+                            else:
+                                prompt_msgs = msgs
+
+                            # prompt：添加 generation prompt，输出将从 assistant 开始生成
+                            prompt = tokenizer.apply_chat_template(
+                                prompt_msgs,
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+                        except Exception:
+                            prompt = row.get(DATASET_TEXT_FIELD, None)
+                    else:
+                        prompt = row.get(DATASET_TEXT_FIELD, None)
+
+                    if prompt is None:
+                        continue
+
+                    # 文本截断
+                    def _trunc(s):
+                        if s is None:
+                            return ""
+                        s = str(s)
+                        return (s[:WANDB_TABLE_TEXT_TRUNCATE] + "...") if len(s) > WANDB_TABLE_TEXT_TRUNCATE else s
+
+                    # tokenize + generate
+                    inputs = tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=MAX_SEQ_LENGTH,
+                    )
+                    if torch.cuda.is_available():
+                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                    with torch.no_grad():
+                        gen_ids = model.generate(
+                            **inputs,
+                            max_new_tokens=WANDB_TEST_MAX_NEW_TOKENS,
+                            do_sample=False,
+                            use_cache=True,
+                        )
+
+                    # 只解码新生成部分
+                    prompt_len = inputs["input_ids"].shape[1]
+                    gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+
+                    table.add_data(_trunc(prompt), _trunc(gt), _trunc(gen_text))
+
+                wandb.log({"test_predictions_sample": table})
+                logger.info(">>> WandB table logged: test_predictions_sample")
+            except Exception as e:
+                logger.warning(f"WandB table generation warning: {e}")
+
+        # 上传测试集文件本身作为 Artifact 备份
+        if wandb.run is not None and TEST_DATA_PATH:
+            try:
+                artifact = wandb.Artifact(name="test_dataset", type="dataset")
+                artifact.add_file(TEST_DATA_PATH)
+                wandb.log_artifact(artifact)
+                logger.info(">>> WandB artifact logged: test_dataset")
+            except Exception as e:
+                logger.warning(f"WandB artifact log warning: {e}")
+
+        # 保存模型
+        logger.info(f">>> Saving model to {OUTPUT_DIR}")
+        model.save_pretrained(OUTPUT_DIR) 
+        tokenizer.save_pretrained(OUTPUT_DIR)
+    
+        logger.info(">>> Training Complete.")
+
+        # 显存清理
+        logger.info(">>> Cleaning up GPU memory...")
+        del model, trainer
+        gc.collect()
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     train()
