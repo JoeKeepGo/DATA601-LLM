@@ -39,7 +39,7 @@ You are a content moderation expert. Analyze the comment and output a JSON objec
 def load_model(model_name):
     print(f"Loading model: {model_name} in 8-bit.")
     
-    HF_TOKEN = "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"
+    HF_TOKEN = os.getenv("HF_TOKEN")
 
     import gc
     gc.collect()

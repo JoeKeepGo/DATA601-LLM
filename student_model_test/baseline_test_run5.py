@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 MODEL_ALIAS = "DeepSeek-R1-8B"
 
-HF_TOKEN = "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"
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 # 实验参数
 NUM_RUNS = 5      # 运行次数

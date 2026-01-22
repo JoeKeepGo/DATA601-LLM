@@ -25,7 +25,7 @@ CANDIDATE_MODELS = [
     {"id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B", "alias": "DeepSeek-R1-8B"}
 ]
 
-HF_TOKEN = "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"
+HF_TOKEN = os.getenv("HF_TOKEN")
 BASE_DIR = "/home/data601/project"
 TRAIN_FILE = os.path.join(BASE_DIR, "dataset_split/train.jsonl")
 TEST_FILE = os.path.join(BASE_DIR, "dataset_split/test.jsonl")
