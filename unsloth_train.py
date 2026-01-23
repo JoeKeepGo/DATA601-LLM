@@ -1,6 +1,20 @@
+import os
+import hashlib
+import shutil
+
+cache_paths = [
+    "/root/autodl-tmp/home/data601/project/unsloth_compiled_cache",
+    os.path.expanduser("~/.cache/unsloth"),
+]
+for p in cache_paths:
+    if os.path.exists(p):
+        shutil.rmtree(p)
+
+os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+
 import unsloth
 from unsloth import FastLanguageModel
-import os
 import torch
 import torch.nn.functional as F
 import logging
@@ -20,15 +34,20 @@ from transformers.trainer_callback import PrinterCallback
 # WandB 配置
 WANDB_PROJECT = "DATA601"
 WANDB_ENTITY = "joeyang97"
-WANDB_RUN_NAME = "FFT-5k-5e4-1ep-32x2-21Jan-4"
+WANDB_RUN_NAME = "FFT-5k-5e4-1ep-32x2-23Jan-1"
+
+def _default_wandb_run_id(run_name: str) -> str:
+    return hashlib.sha1(run_name.encode("utf-8")).hexdigest()[:8]
+
+WANDB_RUN_ID = os.environ.get("WANDB_RUN_ID") or _default_wandb_run_id(WANDB_RUN_NAME)
 WANDB_KEY = "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"
 
 # 路径与模型
 BASE_DIR = "/home/data601/project"
 MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507" 
-DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train_quality_hybrid_cot.jsonl")
+DATA_PATH = os.path.join(BASE_DIR, "dataset/train/train.jsonl")
 # 独立 Test 集路径若为 None 则跳过 Test 评估
-TEST_DATA_PATH = os.path.join(BASE_DIR, "dataset/test/train_quality_hybrid_cot_test.jsonl")
+TEST_DATA_PATH = os.path.join(BASE_DIR, "dataset/test/test.jsonl")
 OUTPUT_DIR = os.path.join(BASE_DIR, "fine_tuned_model", WANDB_RUN_NAME)
 
 # 模型加载参数
@@ -72,9 +91,9 @@ USE_GRADIENT_CHECKPOINTING = "unsloth"
 
 # 训练超参数 (SFTConfig)
 MAX_SEQ_LENGTH = 4096     # 上下文长度
-LEARNING_RATE = 3e-4      # 学习率 (LoRA: 2e-4, Full: 2e-5)
-BATCH_SIZE = 32            # Per Device Batch Size
-GRAD_ACCUMULATION = 4     # 梯度累积步数，默认 2
+LEARNING_RATE = 5e-4      # 学习率 (LoRA: 2e-4, Full: 2e-5)
+BATCH_SIZE = 16            # Per Device Batch Size
+GRAD_ACCUMULATION = 2     # 梯度累积步数，默认 2
 NUM_EPOCHS = 1            # 训练轮数
 WARMUP_RATIO = 0.01       # 预热比例
 
@@ -86,8 +105,8 @@ SAVE_TOTAL_LIMIT = 2      # 最多保留多少个 Checkpoint
 
 # 验证与评估配置
 EVAL_STRATEGY = "steps"   # 开启评估：按步数进行
-EVAL_STEPS = 5            # 每多少步评估一次
-EVAL_BATCH_SIZE = 16      # 验证集的 Batch Size
+EVAL_STEPS = 10            # 每多少步评估一次
+EVAL_BATCH_SIZE = 8      # 验证集的 Batch Size
 TEST_SIZE = 0.01          # 验证集比例 (% 数据用于验证)
 
 # 优化器配置
@@ -102,6 +121,7 @@ NEFTUNE_NOISE_ALPHA = 10
 
 # Packing
 PACKING = False
+REMOVE_UNUSED_COLUMNS = False
 
 # Loss 计算方式配置
 # 选项:
@@ -109,15 +129,15 @@ PACKING = False
 # "token_micro" 按有效 token 数做 micro-average（sum / #valid_tokens）
 # "sentence_macro" 先每条样本平均，再对 batch 平均（对短样本权重大）
 # "tail_weighted" 对序列尾部 token 加权（后半段更重要）
-LOSS_METHOD = "default"
+LOSS_METHOD = "tail_weighted"
 
 # 仅当 LOSS_METHOD="tail_weighted" 时生效
-TAIL_WEIGHT = 2.0          # 尾部权重倍数
-TAIL_PORTION = 0.5         # 尾部比例：0.5 表示最后 50% token
+TAIL_WEIGHT = 1.5          # 尾部权重倍数
+TAIL_PORTION = 0.3         # 尾部比例：0.5 表示最后 50% token
 
 # Test 结果可视化（WandB）
 ENABLE_WANDB_TEST_TABLE = True # True: 训练结束后在 Test 集抽样生成预测并上传 WandB Table
-WANDB_TEST_TABLE_SAMPLES = 20 # 抽样条数
+WANDB_TEST_TABLE_SAMPLES = 50 # 抽样条数
 WANDB_TEST_MAX_NEW_TOKENS = 2048 # 每条样本生成的最大 token 数
 WANDB_TABLE_TEXT_TRUNCATE = 4096 # 记录到 Table 的文本截断长度（字符数）
 
@@ -162,7 +182,40 @@ class CustomSFTTrainer(SFTTrainer):
             )
 
         outputs = model(**inputs)
-        logits = outputs.logits
+        try:
+            logits = outputs.logits
+        except NotImplementedError:
+            # Unsloth may disable logits; fall back to model loss if available.
+            if hasattr(outputs, "loss") and outputs.loss is not None:
+                return (outputs.loss, outputs) if return_outputs else outputs.loss
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+        if not torch.is_tensor(logits):
+            if hasattr(outputs, "loss") and outputs.loss is not None:
+                return (outputs.loss, outputs) if return_outputs else outputs.loss
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+        if logits.numel() == 0:
+            if hasattr(outputs, "loss") and outputs.loss is not None:
+                return (outputs.loss, outputs) if return_outputs else outputs.loss
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+                **kwargs,
+            )
+
         labels = inputs.get("labels", None)
         if labels is None:
             return super().compute_loss(
@@ -224,6 +277,28 @@ class CustomSFTTrainer(SFTTrainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        loss, logits, labels = super().prediction_step(
+            model,
+            inputs,
+            prediction_loss_only,
+            ignore_keys=ignore_keys,
+        )
+        if logits is None:
+            return loss, logits, labels
+        if isinstance(logits, (tuple, list)):
+            if len(logits) == 0 or not torch.is_tensor(logits[0]):
+                return loss, None, labels
+        elif not torch.is_tensor(logits):
+            return loss, None, labels
+        return loss, logits, labels
+
 # 训练代码
 def train():
 
@@ -261,11 +336,25 @@ def train():
     os.environ["WANDB_PROJECT"] = WANDB_PROJECT
     os.environ["WANDB_ENTITY"] = WANDB_ENTITY
     os.environ["WANDB_WATCH"] = "false"
+    os.environ.setdefault("WANDB_NAME", WANDB_RUN_NAME)
+    os.environ.setdefault("WANDB_RUN_ID", WANDB_RUN_ID)
+    os.environ.setdefault("WANDB_RESUME", "allow")
     
     try:
         wandb.login(key=WANDB_KEY)
     except Exception as e:
         logger.warning(f"WandB login warning: {e}")
+    try:
+        if wandb.run is None:
+            wandb.init(
+                project=WANDB_PROJECT,
+                entity=WANDB_ENTITY,
+                name=WANDB_RUN_NAME,
+                id=WANDB_RUN_ID,
+                resume="allow",
+            )
+    except Exception as e:
+        logger.warning(f"WandB init warning: {e}")
 
     # 加载模型
     logger.info(f">>> Loading model: {MODEL_ID}")
@@ -412,6 +501,7 @@ def train():
             # 数据集参数
             dataset_kwargs = {"add_special_tokens": False},
             packing = PACKING,
+            remove_unused_columns = REMOVE_UNUSED_COLUMNS,
         ),
     )
 
@@ -450,13 +540,48 @@ def train():
     if trainable_params == 0:
         logger.error("!!! ERROR: No trainable parameters found. Gradients will be 0. !!!")
         sys.exit(1)
-        
+
     trainer_stats = trainer.train()
 
-
-        # 训练结束后对独立 Test 集做最终评估
+    # 训练结束后对独立 Test 集做最终评估
     if test_dataset is not None:
         logger.info(">>> Running final evaluation on Test set...")
+
+        # Ensure test dataset is tokenized to match the collator's expectations.
+        eval_packing = trainer.args.packing if trainer.args.eval_packing is None else trainer.args.eval_packing
+        processing_class = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+        test_dataset = trainer._prepare_dataset(
+            test_dataset,
+            processing_class,
+            trainer.args,
+            eval_packing,
+            formatting_func=None,
+            dataset_name="test",
+        )
+
+        # Ensure WandB run is initialized for eval logging.
+        report_to = trainer.args.report_to
+        wandb_enabled = (
+            (isinstance(report_to, str) and report_to == "wandb")
+            or (isinstance(report_to, (list, tuple, set)) and "wandb" in report_to)
+        )
+        if wandb_enabled and wandb.run is None:
+            try:
+                wandb.init(
+                    project=WANDB_PROJECT,
+                    entity=WANDB_ENTITY,
+                    name=WANDB_RUN_NAME,
+                    id=WANDB_RUN_ID,
+                    resume="allow",
+                )
+            except Exception as e:
+                logger.warning(f"WandB init warning: {e}")
+                try:
+                    from transformers.integrations import WandbCallback
+
+                    trainer.remove_callback(WandbCallback)
+                except Exception as e2:
+                    logger.warning(f"WandB callback remove warning: {e2}")
 
         # 获取评估结果
         test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
@@ -566,18 +691,18 @@ def train():
             except Exception as e:
                 logger.warning(f"WandB artifact log warning: {e}")
 
-        # 保存模型
-        logger.info(f">>> Saving model to {OUTPUT_DIR}")
-        model.save_pretrained(OUTPUT_DIR) 
-        tokenizer.save_pretrained(OUTPUT_DIR)
-    
-        logger.info(">>> Training Complete.")
+    # 保存模型
+    logger.info(f">>> Saving model to {OUTPUT_DIR}")
+    model.save_pretrained(OUTPUT_DIR) 
+    tokenizer.save_pretrained(OUTPUT_DIR)
+                
+    logger.info(">>> Training Complete.")
 
-        # 显存清理
-        logger.info(">>> Cleaning up GPU memory...")
-        del model, trainer
-        gc.collect()
-        torch.cuda.empty_cache()
+    # 显存清理
+    logger.info(">>> Cleaning up GPU memory...")
+    del model, trainer
+    gc.collect()
+    torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     train()
