@@ -28,6 +28,10 @@ parser.add_argument("--run_name", type=str, required=True, help="Unique name for
 parser.add_argument("--output_dir_base", type=str, default="/home/data601/project/fine_tuned_model", help="Base directory for saving models")
 parser.add_argument("--dataset_size", type=int, default=None, help="Number of samples to use (None for all)")
 parser.add_argument("--seed", type=int, default=3407, help="Random seed")
+parser.add_argument("--torch_compile", action="store_true", help="Enable torch.compile")
+parser.add_argument("--tf32", action="store_true", dest="tf32", help="Enable TF32")
+parser.add_argument("--no_tf32", action="store_false", dest="tf32", help="Disable TF32")
+parser.set_defaults(tf32=None)
 
 # [训练超参]
 parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
@@ -35,6 +39,7 @@ parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs"
 parser.add_argument("--batch_size", type=int, default=16, help="Per device batch size")
 parser.add_argument("--grad_accumulation", type=int, default=2, help="Gradient accumulation steps")
 parser.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio")
+parser.add_argument("--max_steps", type=int, default=-1, help="Max steps override (-1 disables)")
 parser.add_argument("--max_seq_length", type=int, default=4096, help="Max sequence length")
 
 # [模式选择: LoRA vs FFT]
@@ -51,7 +56,24 @@ parser.add_argument("--loss_method", type=str, default="tail_weighted", choices=
 parser.add_argument("--tail_weight", type=float, default=1.5, help="Tail weight for tail_weighted loss")
 parser.add_argument("--tail_portion", type=float, default=0.3, help="Tail portion in (0, 1] for tail_weighted loss")
 
+# [评估与日志]
+parser.add_argument("--logging_steps", type=int, default=1, help="Logging interval in steps")
+parser.add_argument("--eval_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="Evaluation strategy")
+parser.add_argument("--eval_steps", type=int, default=10, help="Evaluation interval in steps")
+parser.add_argument("--save_strategy", type=str, default="steps", choices=["no", "steps", "epoch"], help="Save strategy")
+parser.add_argument("--save_steps", type=int, default=50, help="Save interval in steps")
+parser.add_argument("--save_total_limit", type=int, default=2, help="Max number of checkpoints to keep")
+parser.add_argument("--load_best_model_at_end", action="store_true", help="Load best model at end")
+parser.add_argument("--metric_for_best_model", type=str, default=None, help="Metric for best model")
+parser.add_argument("--greater_is_better", type=str, default=None, help="Whether greater metric is better (true/false)")
+parser.add_argument("--dataloader_num_workers", type=int, default=0, help="DataLoader workers")
+
 # [其他高级配置]
+parser.add_argument("--gradient_checkpointing", action="store_true", dest="gradient_checkpointing", help="Enable gradient checkpointing")
+parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing", help="Disable gradient checkpointing")
+parser.set_defaults(gradient_checkpointing=None)
+parser.add_argument("--bf16", action="store_true", default=None, help="Force bf16")
+parser.add_argument("--fp16", action="store_true", default=None, help="Force fp16")
 parser.add_argument("--load_in_4bit", action="store_true", help="Use 4bit quantization loading")
 
 args = parser.parse_args()
@@ -64,6 +86,18 @@ if args.max_grad_norm < 0:
     parser.error("--max_grad_norm must be >= 0.")
 if args.neftune_noise_alpha < 0:
     parser.error("--neftune_noise_alpha must be >= 0.")
+if args.bf16 and args.fp16:
+    parser.error("--bf16 and --fp16 cannot both be enabled.")
+
+def _parse_optional_bool(value, name):
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v in ("true", "1", "yes", "y", "t"):
+        return True
+    if v in ("false", "0", "no", "n", "f"):
+        return False
+    parser.error(f"--{name} must be a boolean value (true/false).")
 
 # ==================== 2. 全局配置映射 (Global Config) ====================
 # 将命令行参数映射回全局变量，以保持后续逻辑不变
@@ -78,7 +112,11 @@ for p in cache_paths:
         shutil.rmtree(p)
 
 os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "0" if args.torch_compile else "1"
+
+if args.tf32 is not None:
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    torch.backends.cudnn.allow_tf32 = args.tf32
 
 # WandB 配置
 WANDB_PROJECT = "DATA601"
@@ -101,6 +139,17 @@ OUTPUT_DIR = os.path.join(args.output_dir_base, args.run_name) # 动态路径
 # 动态参数映射
 DTYPE = None 
 LOAD_IN_4BIT = args.load_in_4bit
+GREATER_IS_BETTER = _parse_optional_bool(args.greater_is_better, "greater_is_better")
+
+if args.bf16:
+    USE_BF16 = True
+    USE_FP16 = False
+elif args.fp16:
+    USE_BF16 = False
+    USE_FP16 = True
+else:
+    USE_BF16 = torch.cuda.is_bf16_supported()
+    USE_FP16 = not USE_BF16
 DATA_SAMPLE_COUNT = args.dataset_size 
 DATASET_BATCHED = True
 DATASET_TEXT_FIELD = "text"
@@ -115,7 +164,13 @@ RANDOM_SEED = args.seed
 LORA_RANK = args.lora_rank
 LORA_ALPHA = args.lora_alpha
 LORA_DROPOUT = args.lora_dropout
-USE_GRADIENT_CHECKPOINTING = "unsloth" 
+GRADIENT_CHECKPOINTING = args.gradient_checkpointing
+if GRADIENT_CHECKPOINTING is None:
+    LORA_GRADIENT_CHECKPOINTING = "unsloth"
+    FFT_GRADIENT_CHECKPOINTING = False
+else:
+    LORA_GRADIENT_CHECKPOINTING = "unsloth" if GRADIENT_CHECKPOINTING else False
+    FFT_GRADIENT_CHECKPOINTING = GRADIENT_CHECKPOINTING
 
 # 训练超参数
 MAX_SEQ_LENGTH = args.max_seq_length
@@ -124,19 +179,25 @@ BATCH_SIZE = args.batch_size
 GRAD_ACCUMULATION = args.grad_accumulation
 NUM_EPOCHS = args.num_epochs
 WARMUP_RATIO = args.warmup_ratio
+MAX_STEPS = args.max_steps
 
-# 日志与保存配置 (固定配置)
-LOGGING_STEPS = 1         
-SAVE_STRATEGY = "steps"   
-SAVE_STEPS = 50          
-SAVE_TOTAL_LIMIT = 2      
+# 日志与保存配置
+LOGGING_STEPS = args.logging_steps
+SAVE_STRATEGY = args.save_strategy
+SAVE_STEPS = args.save_steps
+SAVE_TOTAL_LIMIT = args.save_total_limit
 
 # 验证与评估配置
-EVAL_STRATEGY = "steps"   
-EVAL_STEPS = 10            
+EVAL_STRATEGY = args.eval_strategy
+EVAL_STEPS = args.eval_steps
 EVAL_BATCH_SIZE = 8      
 TEST_SIZE = 0.01          
 TEST_EVAL_DURING_TRAIN = True 
+
+# 其他训练控制
+LOAD_BEST_MODEL_AT_END = args.load_best_model_at_end
+METRIC_FOR_BEST_MODEL = args.metric_for_best_model
+DATALOADER_NUM_WORKERS = args.dataloader_num_workers
 
 # 优化器与Loss配置
 OPTIMIZER = "adamw_torch_fused" 
@@ -331,7 +392,7 @@ def train():
             lora_alpha = LORA_ALPHA,
             lora_dropout = LORA_DROPOUT, 
             bias = "none",    
-            use_gradient_checkpointing = USE_GRADIENT_CHECKPOINTING,
+            use_gradient_checkpointing = LORA_GRADIENT_CHECKPOINTING,
             random_state = RANDOM_SEED,
         )
     else:
@@ -339,6 +400,9 @@ def train():
         for name, param in model.named_parameters():
             param.requires_grad = True
         logger.info(">>> All parameters unfrozen for Full Fine-Tuning.")
+        if FFT_GRADIENT_CHECKPOINTING:
+            model.gradient_checkpointing_enable()
+            logger.info(">>> Gradient checkpointing enabled for Full Fine-Tuning.")
 
     logger.info(f">>> Loading dataset from {DATA_PATH}")
     dataset = load_dataset("json", data_files=DATA_PATH, split="train")
@@ -391,13 +455,12 @@ def train():
         learning_rate = final_lr,
         neftune_noise_alpha = NEFTUNE_NOISE_ALPHA,
         max_grad_norm = MAX_GRAD_NORM,
-        fp16 = not torch.cuda.is_bf16_supported(),
-        bf16 = torch.cuda.is_bf16_supported(),
+        fp16 = USE_FP16,
+        bf16 = USE_BF16,
         logging_steps = LOGGING_STEPS,
         save_strategy = SAVE_STRATEGY,
         save_steps = SAVE_STEPS,
         save_total_limit = SAVE_TOTAL_LIMIT,
-        eval_strategy = EVAL_STRATEGY,
         eval_steps = EVAL_STEPS,
         per_device_eval_batch_size = EVAL_BATCH_SIZE,
         optim = OPTIMIZER,
@@ -411,6 +474,24 @@ def train():
         remove_unused_columns = REMOVE_UNUSED_COLUMNS,
     )
     sft_config_params = inspect.signature(SFTConfig.__init__).parameters
+    if MAX_STEPS is not None and MAX_STEPS > 0 and "max_steps" in sft_config_params:
+        sft_config_kwargs["max_steps"] = MAX_STEPS
+    if "evaluation_strategy" in sft_config_params:
+        sft_config_kwargs["evaluation_strategy"] = EVAL_STRATEGY
+    elif "eval_strategy" in sft_config_params:
+        sft_config_kwargs["eval_strategy"] = EVAL_STRATEGY
+    if "dataloader_num_workers" in sft_config_params:
+        sft_config_kwargs["dataloader_num_workers"] = DATALOADER_NUM_WORKERS
+    if "load_best_model_at_end" in sft_config_params:
+        sft_config_kwargs["load_best_model_at_end"] = LOAD_BEST_MODEL_AT_END
+    if METRIC_FOR_BEST_MODEL is not None and "metric_for_best_model" in sft_config_params:
+        sft_config_kwargs["metric_for_best_model"] = METRIC_FOR_BEST_MODEL
+    if GREATER_IS_BETTER is not None and "greater_is_better" in sft_config_params:
+        sft_config_kwargs["greater_is_better"] = GREATER_IS_BETTER
+    if args.torch_compile and "torch_compile" in sft_config_params:
+        sft_config_kwargs["torch_compile"] = True
+    if GRADIENT_CHECKPOINTING is not None and "gradient_checkpointing" in sft_config_params:
+        sft_config_kwargs["gradient_checkpointing"] = GRADIENT_CHECKPOINTING
     if "dataset_text_field" in sft_config_params:
         sft_config_kwargs["dataset_text_field"] = DATASET_TEXT_FIELD
     if "max_seq_length" in sft_config_params:
