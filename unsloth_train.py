@@ -1,5 +1,6 @@
 import os
 import hashlib
+import json
 import shutil
 
 cache_paths = [
@@ -27,14 +28,14 @@ import numpy as np
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments
-from transformers.trainer_callback import PrinterCallback
+from transformers.trainer_callback import PrinterCallback, TrainerCallback
 
 # ==================== 全局配置 ====================
 
 # WandB 配置
 WANDB_PROJECT = "DATA601"
 WANDB_ENTITY = "joeyang97"
-WANDB_RUN_NAME = "FFT-5k-5e4-1ep-32x2-23Jan-1"
+WANDB_RUN_NAME = "FFT-5k-5e4-1ep-32x2-23Jan-2"
 
 def _default_wandb_run_id(run_name: str) -> str:
     return hashlib.sha1(run_name.encode("utf-8")).hexdigest()[:8]
@@ -95,7 +96,7 @@ LEARNING_RATE = 5e-4      # 学习率 (LoRA: 2e-4, Full: 2e-5)
 BATCH_SIZE = 16            # Per Device Batch Size
 GRAD_ACCUMULATION = 2     # 梯度累积步数，默认 2
 NUM_EPOCHS = 1            # 训练轮数
-WARMUP_RATIO = 0.01       # 预热比例
+WARMUP_RATIO = 0.03       # 预热比例
 
 # 日志与保存配置
 LOGGING_STEPS = 1         # 每隔多少步打印一次日志
@@ -108,6 +109,7 @@ EVAL_STRATEGY = "steps"   # 开启评估：按步数进行
 EVAL_STEPS = 10            # 每多少步评估一次
 EVAL_BATCH_SIZE = 8      # 验证集的 Batch Size
 TEST_SIZE = 0.01          # 验证集比例 (% 数据用于验证)
+TEST_EVAL_DURING_TRAIN = True  # 是否在每次 eval 时同步评估 Test 集
 
 # 优化器配置
 # 选项: "adamw_8bit", "adamw_torch", "adamw_torch_fused"
@@ -140,6 +142,11 @@ ENABLE_WANDB_TEST_TABLE = True # True: 训练结束后在 Test 集抽样生成�
 WANDB_TEST_TABLE_SAMPLES = 50 # 抽样条数
 WANDB_TEST_MAX_NEW_TOKENS = 2048 # 每条样本生成的最大 token 数
 WANDB_TABLE_TEXT_TRUNCATE = 4096 # 记录到 Table 的文本截断长度（字符数）
+WANDB_TABLE_BATCH_SIZE = 4  # WandB Table 生成时的 batch size
+WANDB_TABLE_INCLUDE_MESSAGES = True  # 记录原始 messages JSON
+WANDB_TABLE_INCLUDE_RAW_TEXT = True  # 记录原始 text 字段
+WANDB_TABLE_LOG_TOKEN_COUNTS = True  # 记录 token 数
+WANDB_TABLE_LOG_CHAR_COUNTS = True   # 记录字符数
 
 # 指标计算函数
 # 在 GPU 上直接计算 argmax，避免传输巨大的 Logits 到 CPU，避免计算 Accuracy 产生 OOM
@@ -302,35 +309,8 @@ class CustomSFTTrainer(SFTTrainer):
 # 训练代码
 def train():
 
-    # 设置日志记录
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    log_file = os.path.join(OUTPUT_DIR, "train.log")
-
-    transformers.logging.disable_default_handler()
-
+    logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.handlers = []
-    logger.propagate = False
-    
-    file_handler = logging.FileHandler(log_file, mode='w')
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
-    logger.addHandler(file_handler)
-    
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(logging.Formatter('%(message)s'))
-    logger.addHandler(console_handler)
-
-    metric_logger = logging.getLogger("metrics")
-    metric_logger.setLevel(logging.INFO)
-    metric_logger.handlers = []
-    metric_logger.propagate = False # 禁止传播
-    
-    metric_file_handler = logging.FileHandler(log_file, mode='a')
-    metric_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
-    metric_logger.addHandler(metric_file_handler)
-
-    logger.info(f"Training started. Logging to {log_file}")
 
     # 登录 WandB
     os.environ["WANDB_PROJECT"] = WANDB_PROJECT
@@ -427,20 +407,20 @@ def train():
 
 
     # 加载独立 Test 集
-    test_dataset = None
+    test_dataset_raw = None
     if TEST_DATA_PATH:
         logger.info(f">>> Loading TEST dataset from {TEST_DATA_PATH}")
-        test_dataset = load_dataset("json", data_files=TEST_DATA_PATH, split="train")
+        test_dataset_raw = load_dataset("json", data_files=TEST_DATA_PATH, split="train")
 
         # 如果 test 数据还没格式化为 text，则复用同样的 formatting 函数
-        if DATASET_TEXT_FIELD not in test_dataset.column_names:
-            if "messages" not in test_dataset.column_names:
+        if DATASET_TEXT_FIELD not in test_dataset_raw.column_names:
+            if "messages" not in test_dataset_raw.column_names:
                 logger.error(f"!!! ERROR: Test dataset missing 'messages' or '{DATASET_TEXT_FIELD}' field.")
                 sys.exit(1)
             logger.info(">>> Formatting TEST dataset...")
-            test_dataset = test_dataset.map(formatting_prompts_func, batched = DATASET_BATCHED)
+            test_dataset_raw = test_dataset_raw.map(formatting_prompts_func, batched = DATASET_BATCHED)
 
-        logger.info(f"    Test Samples: {len(test_dataset)}")
+        logger.info(f"    Test Samples: {len(test_dataset_raw)}")
 
     # 配置训练器
     logger.info(">>> Initializing Trainer...")
@@ -505,22 +485,48 @@ def train():
         ),
     )
 
-    # 移除控制台 Log
-    
-    callbacks_to_remove = [
-        c for c in trainer.callback_handler.callbacks 
-        if isinstance(c, PrinterCallback)
-    ]
+    # 预处理 Test 集以便评估使用（保留 raw 版本用于可视化）
+    test_dataset_eval = None
+    if test_dataset_raw is not None:
+        logger.info(">>> Preparing TEST dataset for evaluation...")
+        eval_packing = trainer.args.packing if trainer.args.eval_packing is None else trainer.args.eval_packing
+        processing_class = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+        test_dataset_eval = trainer._prepare_dataset(
+            test_dataset_raw,
+            processing_class,
+            trainer.args,
+            eval_packing,
+            formatting_func=None,
+            dataset_name="test",
+        )
 
-    for c in callbacks_to_remove:
-        trainer.remove_callback(c)
-    
-    class FileLogCallback(PrinterCallback):
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            if logs:
-                metric_logger.info(f"Step {state.global_step}: {logs}")
-                
-    trainer.add_callback(FileLogCallback)
+        if TEST_EVAL_DURING_TRAIN:
+            class TestEvalCallback(TrainerCallback):
+                def __init__(self, trainer, test_dataset):
+                    self.trainer = trainer
+                    self.test_dataset = test_dataset
+                    self._in_test_eval = False
+
+                def on_evaluate(self, args, state, control, **kwargs):
+                    if self.test_dataset is None:
+                        return control
+                    if not getattr(self.trainer, "is_in_train", False):
+                        return control
+                    if self._in_test_eval:
+                        return control
+                    self._in_test_eval = True
+                    try:
+                        self.trainer.evaluate(
+                            eval_dataset=self.test_dataset,
+                            metric_key_prefix="test",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Test eval warning: {e}")
+                    finally:
+                        self._in_test_eval = False
+                    return control
+
+            trainer.add_callback(TestEvalCallback(trainer, test_dataset_eval))
 
     # 开始训练
     logger.info(">>> Starting Training...")
@@ -544,20 +550,20 @@ def train():
     trainer_stats = trainer.train()
 
     # 训练结束后对独立 Test 集做最终评估
-    if test_dataset is not None:
+    if test_dataset_raw is not None:
         logger.info(">>> Running final evaluation on Test set...")
 
-        # Ensure test dataset is tokenized to match the collator's expectations.
-        eval_packing = trainer.args.packing if trainer.args.eval_packing is None else trainer.args.eval_packing
-        processing_class = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
-        test_dataset = trainer._prepare_dataset(
-            test_dataset,
-            processing_class,
-            trainer.args,
-            eval_packing,
-            formatting_func=None,
-            dataset_name="test",
-        )
+        if test_dataset_eval is None:
+            eval_packing = trainer.args.packing if trainer.args.eval_packing is None else trainer.args.eval_packing
+            processing_class = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+            test_dataset_eval = trainer._prepare_dataset(
+                test_dataset_raw,
+                processing_class,
+                trainer.args,
+                eval_packing,
+                formatting_func=None,
+                dataset_name="test",
+            )
 
         # Ensure WandB run is initialized for eval logging.
         report_to = trainer.args.report_to
@@ -584,7 +590,7 @@ def train():
                     logger.warning(f"WandB callback remove warning: {e2}")
 
         # 获取评估结果
-        test_metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
+        test_metrics = trainer.evaluate(eval_dataset=test_dataset_eval, metric_key_prefix="test")
 
         # 打印并保存到本地日志
         logger.info(f">>> Test metrics: {test_metrics}")
@@ -603,12 +609,29 @@ def train():
                 logger.info(">>> Generating predictions for WandB table (sampled)...")
 
                 # 固定抽样
-                n = min(WANDB_TEST_TABLE_SAMPLES, len(test_dataset))
-                sampled = test_dataset.shuffle(seed=RANDOM_SEED).select(range(n))
+                n = min(WANDB_TEST_TABLE_SAMPLES, len(test_dataset_raw))
+                sampled = test_dataset_raw.shuffle(seed=RANDOM_SEED).select(range(n))
 
-                table = wandb.Table(columns=["Prompt", "Ground Truth", "Model Output"])
+                table_columns = ["Index", "Prompt", "Ground Truth", "Model Output"]
+                if WANDB_TABLE_INCLUDE_MESSAGES:
+                    table_columns.append("Messages JSON")
+                if WANDB_TABLE_INCLUDE_RAW_TEXT:
+                    table_columns.append("Raw Text")
+                if WANDB_TABLE_LOG_TOKEN_COUNTS:
+                    table_columns.extend(["Prompt Tokens", "GT Tokens", "Gen Tokens"])
+                if WANDB_TABLE_LOG_CHAR_COUNTS:
+                    table_columns.extend(["Prompt Chars", "GT Chars", "Gen Chars"])
+                table_columns.append("Exact Match")
+                table = wandb.Table(columns=table_columns)
 
-                model.eval()
+                # 文本截断
+                def _trunc(s):
+                    if s is None:
+                        return ""
+                    s = str(s)
+                    return (s[:WANDB_TABLE_TEXT_TRUNCATE] + "...") if len(s) > WANDB_TABLE_TEXT_TRUNCATE else s
+
+                rows = []
                 for i in range(n):
                     row = sampled[i]
 
@@ -645,39 +668,105 @@ def train():
                     if prompt is None:
                         continue
 
-                    # 文本截断
-                    def _trunc(s):
-                        if s is None:
-                            return ""
-                        s = str(s)
-                        return (s[:WANDB_TABLE_TEXT_TRUNCATE] + "...") if len(s) > WANDB_TABLE_TEXT_TRUNCATE else s
+                    messages_json = None
+                    if WANDB_TABLE_INCLUDE_MESSAGES and "messages" in row and row["messages"] is not None:
+                        try:
+                            messages_json = json.dumps(row["messages"], ensure_ascii=True, default=str)
+                        except Exception:
+                            messages_json = None
 
-                    # tokenize + generate
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=MAX_SEQ_LENGTH,
+                    raw_text = row.get(DATASET_TEXT_FIELD, None) if WANDB_TABLE_INCLUDE_RAW_TEXT else None
+
+                    rows.append(
+                        {
+                            "index": i,
+                            "prompt": prompt,
+                            "gt": gt,
+                            "messages_json": messages_json,
+                            "raw_text": raw_text,
+                        }
                     )
-                    if torch.cuda.is_available():
-                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-                    with torch.no_grad():
-                        gen_ids = model.generate(
-                            **inputs,
-                            max_new_tokens=WANDB_TEST_MAX_NEW_TOKENS,
-                            do_sample=False,
-                            use_cache=True,
-                        )
+                if len(rows) == 0:
+                    logger.warning("WandB table generation warning: no valid prompts found.")
+                else:
+                    model.eval()
+                    orig_padding_side = tokenizer.padding_side
+                    tokenizer.padding_side = "left"
+                    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+                    batch_size = max(1, WANDB_TABLE_BATCH_SIZE)
+                    try:
+                        for start in range(0, len(rows), batch_size):
+                            batch = rows[start : start + batch_size]
+                            prompts = [r["prompt"] for r in batch]
 
-                    # 只解码新生成部分
-                    prompt_len = inputs["input_ids"].shape[1]
-                    gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+                            inputs = tokenizer(
+                                prompts,
+                                return_tensors="pt",
+                                padding=True,
+                                truncation=True,
+                                max_length=MAX_SEQ_LENGTH,
+                            )
+                            if torch.cuda.is_available():
+                                inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-                    table.add_data(_trunc(prompt), _trunc(gt), _trunc(gen_text))
+                            with torch.no_grad():
+                                gen_ids = model.generate(
+                                    **inputs,
+                                    max_new_tokens=WANDB_TEST_MAX_NEW_TOKENS,
+                                    do_sample=False,
+                                    use_cache=True,
+                                    pad_token_id=pad_token_id,
+                                )
 
-                wandb.log({"test_predictions_sample": table})
-                logger.info(">>> WandB table logged: test_predictions_sample")
+                            input_len = inputs["input_ids"].shape[1]
+                            prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
+
+                            for bi, r in enumerate(batch):
+                                seq = gen_ids[bi]
+                                seq_len = int(seq.shape[0])
+                                if pad_token_id is not None:
+                                    while seq_len > 0 and int(seq[seq_len - 1]) == pad_token_id:
+                                        seq_len -= 1
+                                gen_text = tokenizer.decode(seq[input_len:seq_len], skip_special_tokens=True)
+
+                                row_data = [r["index"], _trunc(r["prompt"]), _trunc(r["gt"]), _trunc(gen_text)]
+                                if WANDB_TABLE_INCLUDE_MESSAGES:
+                                    row_data.append(_trunc(r["messages_json"]))
+                                if WANDB_TABLE_INCLUDE_RAW_TEXT:
+                                    row_data.append(_trunc(r["raw_text"]))
+                                if WANDB_TABLE_LOG_TOKEN_COUNTS:
+                                    gt_tokens = None
+                                    if r["gt"] is not None:
+                                        gt_tokens = len(
+                                            tokenizer(
+                                                r["gt"],
+                                                add_special_tokens=False,
+                                                truncation=True,
+                                                max_length=MAX_SEQ_LENGTH,
+                                            )["input_ids"]
+                                        )
+                                    gen_tokens = max(0, seq_len - input_len)
+                                    row_data.extend([int(prompt_lens[bi]), gt_tokens, int(gen_tokens)])
+                                if WANDB_TABLE_LOG_CHAR_COUNTS:
+                                    row_data.extend(
+                                        [
+                                            len(r["prompt"]) if r["prompt"] is not None else None,
+                                            len(r["gt"]) if r["gt"] is not None else None,
+                                            len(gen_text) if gen_text is not None else None,
+                                        ]
+                                    )
+                                exact_match = None
+                                if r["gt"] is not None and gen_text is not None:
+                                    exact_match = r["gt"].strip() == gen_text.strip()
+                                row_data.append(exact_match)
+                                table.add_data(*row_data)
+                    finally:
+                        tokenizer.padding_side = orig_padding_side
+
+                if len(rows) > 0:
+                    wandb.log({"test_predictions_sample": table})
+                    logger.info(">>> WandB table logged: test_predictions_sample")
             except Exception as e:
                 logger.warning(f"WandB table generation warning: {e}")
 
