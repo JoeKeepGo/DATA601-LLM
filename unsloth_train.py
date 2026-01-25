@@ -28,7 +28,7 @@ import numpy as np
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments
-from transformers.trainer_callback import PrinterCallback, TrainerCallback
+from transformers.trainer_callback import TrainerCallback
 
 # ==================== 全局配置 ====================
 
