@@ -78,7 +78,7 @@ experiments = [
         "batch_size": 32,
         "grad_accumulation": auto_grad_accum(32),
         "num_epochs": 1,
-        "max_steps": 200,              # 强制只跑 200 步
+        "max_steps": 100,              # 强制只跑 200 步
         "warmup_ratio": 0.05,
         "save_steps": 200,
         "eval_steps": 50,              # 确保能看到 4 个 Loss 点
@@ -283,30 +283,30 @@ class HeaderView:
 
         status_text = f"[{status_color}]{self.status}[/{status_color}]"
 
-        table = Table.grid(expand=True)
+        table = Table.grid(expand=True, padding=(0, 1))
         table.add_column(justify="right", style="bold cyan", no_wrap=True)
         table.add_column(style="white")
-        table.add_row("Experiment", f"[{self.idx}/{self.total}] {run_name}")
-        table.add_row("Mode", mode)
-        table.add_row("Batch", f"bs={_format_value(batch_size)} | accum={_format_value(grad_accum)} | global={global_batch}")
+        table.add_row("Experiment:", f"[{self.idx}/{self.total}] {run_name}")
+        table.add_row("Mode:", mode)
+        table.add_row("Batch:", f"bs={_format_value(batch_size)} | accum={_format_value(grad_accum)} | global={global_batch}")
         table.add_row(
-            "Data",
+            "Data:",
             f"dataset={dataset_size} | epochs={_format_value(exp.get('num_epochs'))} | max_steps={_format_value(exp.get('max_steps'))}",
         )
         table.add_row(
-            "LR",
+            "LR:",
             f"lr={_format_value(exp.get('learning_rate'))} | warmup={_format_value(exp.get('warmup_ratio'))} | sched={_format_value(exp.get('lr_scheduler_type'))}",
         )
         table.add_row(
-            "Eval/Save",
+            "Eval/Save:",
             f"eval={_format_value(exp.get('eval_strategy'))}@{_format_value(exp.get('eval_steps'))} | save={_format_value(exp.get('save_strategy'))}@{_format_value(exp.get('save_steps'))} | keep={_format_value(exp.get('save_total_limit'))}",
         )
         table.add_row(
-            "Progress",
+            "Progress:",
             f"remaining={remaining} | exp_elapsed={exp_elapsed} | total_elapsed={total_elapsed} | status={status_text}",
         )
         if self.log_file:
-            table.add_row("Log File", self.log_file)
+            table.add_row("Log File:", self.log_file)
 
         return Panel(table, title="Experiment Status", border_style="blue")
 
@@ -322,11 +322,19 @@ class LogView:
     def clear(self):
         self.lines.clear()
 
-    def __rich__(self):
+    def __rich_console__(self, console, options):
         if not self.lines:
-            return Panel(Text("Waiting for output..."), title="Live Output", border_style="cyan")
-        text = Text("\n".join(self.lines))
-        return Panel(text, title="Live Output", border_style="cyan")
+            yield Panel(Text("Waiting for output..."), title="Live Output", border_style="cyan")
+            return
+
+        lines = list(self.lines)
+        max_height = options.max_height
+        if max_height is not None:
+            interior = max(1, max_height - 2)
+            if len(lines) > interior:
+                lines = lines[-interior:]
+        text = Text("\n".join(lines))
+        yield Panel(text, title="Live Output", border_style="cyan")
 
 def _add_arg(cmd, flag, value):
     if value is None:
