@@ -122,10 +122,10 @@ def run_experiments():
             
             except subprocess.CalledProcessError:
                 print(f"Failed! Check {log_file} for details.\n")
-                # 如果实验失败是否终止后续实验？
+                # 实验失败是否终止后续实验？
                 # sys.exit(1) 
 
-        # 等待操作系统回收显存
+        # 回收显存
         time.sleep(10)
 
 if __name__ == "__main__":

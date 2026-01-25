@@ -1,11 +1,14 @@
 import argparse
-import os
+import gc
 import hashlib
+import inspect
 import json
+import logging
+import os
 import shutil
 import sys
-import gc
-import logging
+import unsloth
+from unsloth import FastLanguageModel
 import torch
 import torch.nn.functional as F
 import transformers
@@ -16,8 +19,6 @@ from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainingArguments
 from transformers.trainer_callback import TrainerCallback
-import unsloth
-from unsloth import FastLanguageModel
 
 # ==================== 1. 命令行参数解析 (ArgParse) ====================
 parser = argparse.ArgumentParser(description="Unsloth Fine-Tuning Worker Script")
@@ -246,6 +247,47 @@ class CustomSFTTrainer(SFTTrainer):
             return loss, None, labels
         return loss, logits, labels
 
+def _ensure_special_tokens(tokenizer, logger):
+    def _token_id(token):
+        if token is None:
+            return None
+        return tokenizer.convert_tokens_to_ids(token)
+
+    eos_token = tokenizer.eos_token
+    eos_id = _token_id(eos_token)
+    if eos_id is None:
+        for cand in ("<|im_end|>", "<|endoftext|>", "</s>"):
+            cand_id = _token_id(cand)
+            if cand_id is not None:
+                tokenizer.eos_token = cand
+                eos_token = cand
+                eos_id = cand_id
+                logger.warning(f"Adjusted eos_token to '{cand}' to match tokenizer vocab.")
+                break
+    if eos_id is None:
+        logger.warning("No valid eos_token found in tokenizer vocab; leaving eos_token unset.")
+        eos_token = None
+
+    pad_token = tokenizer.pad_token
+    pad_id = _token_id(pad_token)
+    if pad_id is None:
+        for cand in (pad_token, "<|endoftext|>", "</s>", eos_token):
+            if cand is None:
+                continue
+            cand_id = _token_id(cand)
+            if cand_id is not None:
+                tokenizer.pad_token = cand
+                pad_token = cand
+                pad_id = cand_id
+                logger.warning(f"Adjusted pad_token to '{cand}' to match tokenizer vocab.")
+                break
+    if pad_id is None and eos_token is not None:
+        tokenizer.pad_token = eos_token
+        pad_token = eos_token
+        logger.warning(f"Using eos_token '{eos_token}' as pad_token.")
+
+    return eos_token, pad_token
+
 def train():
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
@@ -277,6 +319,8 @@ def train():
         dtype = DTYPE,
         load_in_4bit = LOAD_IN_4BIT,
     )
+
+    eos_token, pad_token = _ensure_special_tokens(tokenizer, logger)
 
     if USE_LORA:
         logger.info(f">>> Applying LoRA adapters (Rank={LORA_RANK})...")
@@ -338,44 +382,65 @@ def train():
     if not USE_LORA and final_lr > 5e-5:
         logger.warning(f"WARNING: Learning rate {final_lr} might be too high for Full FT.")
 
-    trainer = CustomSFTTrainer(
+    sft_config_kwargs = dict(
+        output_dir = OUTPUT_DIR,
+        per_device_train_batch_size = BATCH_SIZE,
+        gradient_accumulation_steps = GRAD_ACCUMULATION,
+        warmup_ratio = WARMUP_RATIO,
+        num_train_epochs = NUM_EPOCHS,
+        learning_rate = final_lr,
+        neftune_noise_alpha = NEFTUNE_NOISE_ALPHA,
+        max_grad_norm = MAX_GRAD_NORM,
+        fp16 = not torch.cuda.is_bf16_supported(),
+        bf16 = torch.cuda.is_bf16_supported(),
+        logging_steps = LOGGING_STEPS,
+        save_strategy = SAVE_STRATEGY,
+        save_steps = SAVE_STEPS,
+        save_total_limit = SAVE_TOTAL_LIMIT,
+        eval_strategy = EVAL_STRATEGY,
+        eval_steps = EVAL_STEPS,
+        per_device_eval_batch_size = EVAL_BATCH_SIZE,
+        optim = OPTIMIZER,
+        weight_decay = WEIGHT_DECAY,
+        lr_scheduler_type = LR_SCHEDULER_TYPE,
+        seed = RANDOM_SEED,
+        report_to = "wandb",
+        run_name = WANDB_RUN_NAME,
+        dataset_kwargs = {"add_special_tokens": False},
+        packing = PACKING,
+        remove_unused_columns = REMOVE_UNUSED_COLUMNS,
+    )
+    sft_config_params = inspect.signature(SFTConfig.__init__).parameters
+    if "dataset_text_field" in sft_config_params:
+        sft_config_kwargs["dataset_text_field"] = DATASET_TEXT_FIELD
+    if "max_seq_length" in sft_config_params:
+        sft_config_kwargs["max_seq_length"] = MAX_SEQ_LENGTH
+    if "max_length" in sft_config_params:
+        sft_config_kwargs["max_length"] = MAX_SEQ_LENGTH
+    if eos_token is not None and "eos_token" in sft_config_params:
+        sft_config_kwargs["eos_token"] = eos_token
+    if pad_token is not None and "pad_token" in sft_config_params:
+        sft_config_kwargs["pad_token"] = pad_token
+
+    trainer_kwargs = dict(
         model = model,
-        tokenizer = tokenizer,
         train_dataset = train_dataset, 
         eval_dataset = eval_dataset, 
-        dataset_text_field = DATASET_TEXT_FIELD,
-        max_seq_length = MAX_SEQ_LENGTH,
         compute_metrics = compute_metrics,
         preprocess_logits_for_metrics = preprocess_logits_for_metrics,
-        args = SFTConfig(
-            output_dir = OUTPUT_DIR,
-            per_device_train_batch_size = BATCH_SIZE,
-            gradient_accumulation_steps = GRAD_ACCUMULATION,
-            warmup_ratio = WARMUP_RATIO,
-            num_train_epochs = NUM_EPOCHS,
-            learning_rate = final_lr,
-            neftune_noise_alpha = NEFTUNE_NOISE_ALPHA,
-            max_grad_norm = MAX_GRAD_NORM,
-            fp16 = not torch.cuda.is_bf16_supported(),
-            bf16 = torch.cuda.is_bf16_supported(),
-            logging_steps = LOGGING_STEPS,
-            save_strategy = SAVE_STRATEGY,
-            save_steps = SAVE_STEPS,
-            save_total_limit = SAVE_TOTAL_LIMIT,
-            eval_strategy = EVAL_STRATEGY,
-            eval_steps = EVAL_STEPS,
-            per_device_eval_batch_size = EVAL_BATCH_SIZE,
-            optim = OPTIMIZER,
-            weight_decay = WEIGHT_DECAY,
-            lr_scheduler_type = LR_SCHEDULER_TYPE,
-            seed = RANDOM_SEED,
-            report_to = "wandb",
-            run_name = WANDB_RUN_NAME,
-            dataset_kwargs = {"add_special_tokens": False},
-            packing = PACKING,
-            remove_unused_columns = REMOVE_UNUSED_COLUMNS,
-        ),
+        args = SFTConfig(**sft_config_kwargs),
     )
+    trainer_init_params = inspect.signature(SFTTrainer.__init__).parameters
+    if "processing_class" in trainer_init_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+    if "dataset_text_field" in trainer_init_params:
+        trainer_kwargs["dataset_text_field"] = DATASET_TEXT_FIELD
+    if "max_seq_length" in trainer_init_params:
+        trainer_kwargs["max_seq_length"] = MAX_SEQ_LENGTH
+
+    trainer = CustomSFTTrainer(**trainer_kwargs)
 
     test_dataset_eval = None
     if test_dataset_raw is not None:
