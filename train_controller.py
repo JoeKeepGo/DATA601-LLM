@@ -43,9 +43,9 @@ COMMON = {
     "tail_portion": 0.30,
 
     # 评估与日志
-    "logging_steps": 10,           # 高频日志，方便画 WandB 曲线
+    "logging_steps": 1,           # 高频日志，方便画 WandB 曲线
     "eval_strategy": "steps",
-    "eval_steps": 50,              # 每 50 步测一次 Validation Loss
+    "eval_steps": 10,              # 每 50 步测一次 Validation Loss
     "save_strategy": "steps",
     "save_steps": 100,
     "save_total_limit": 3,         # 最多存3个档，节省硬盘
@@ -65,150 +65,21 @@ COMMON = {
 # 实验组菜单
 experiments = [
     # ==========================================================
-    # Exp0: Sanity Check (管线自检)
-    # 目的: 快速跑通代码，确认数据加载无误，验证 Loss 曲线下降
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp0_sanity_200steps",
-        "use_lora": True,
-        "dataset_size": 500,           # 极小数据集
-        "learning_rate": 1e-4,
-        "lora_rank": 32,
-        "lora_alpha": 64,
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 1,
-        "max_steps": 100,              # 强制只跑 200 步
-        "warmup_ratio": 0.05,
-        "save_steps": 200,
-        "eval_steps": 50,              # 确保能看到 4 个 Loss 点
-    }),
-
-    # ==========================================================
-    # Exp1: FFT Golden Benchmark (全量微调基准 - 核心对照组)
-    # 目的: 复现之前跑出的 0.34 Loss。这是本次毕设的"性能天花板"。
-    # 论文点: "在96GB显存支持下，FFT展现了小模型微调的最佳上限。"
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp1_FFT_Benchmark_5k_1ep",
-        "use_lora": False,             # 关闭 LoRA，全量更新
-        "dataset_size": 5000,
-        "learning_rate": 5e-4,         # 激进学习率 (验证有效)
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32), # Accum=2 -> Global=64
-        "num_epochs": 1,               # 1 Epoch 即可
-        "warmup_ratio": 0.03,
-        "save_steps": 100,
-        "eval_steps": 50,
-    }),
-
-    # ==========================================================
     # Exp2: FFT Overfit Boundary (过拟合边界探测)
     # 目的: 故意多跑一轮。如果第2轮 Loss 变高，证明 Exp1 的 Early Stopping 是完美的。
     # 论文点: "验证了 5k 数据量下，1 Epoch 是泛化能力的拐点。"
     # ==========================================================
     dict(COMMON, **{
-        "run_name": "Exp2_FFT_Overfit_5k_2ep",
+        "run_name": "Exp2_FFT_Overfit_5k_2ep_Retest",
         "use_lora": False,
         "dataset_size": 5000,
         "learning_rate": 5e-4,
         "batch_size": 32,
         "grad_accumulation": auto_grad_accum(32),
         "num_epochs": 2,               # 【变量】增加轮数
-        "save_strategy": "epoch",      # 按 Epoch 保存，方便直接对比 Ep1 vs Ep2
-        "eval_strategy": "epoch",
+        "save_steps": 100,      # 按 Epoch 保存，方便直接对比 Ep1 vs Ep2
+        "eval_steps": 10,
         "load_best_model_at_end": True,
-    }),
-
-    # ==========================================================
-    # Exp3: LoRA Challenger (标准对照组)
-    # 目的: 使用标准参数跑 LoRA。
-    # 论文点: "标准设置下的 LoRA 与 FFT 的性能差距量化。"
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp3_LoRA64_base_lr1e4_wu05_5k_3ep",
-        "use_lora": True,
-        "dataset_size": 5000,
-        "learning_rate": 1e-4,         # LoRA 标准 LR
-        "lora_rank": 64,
-        "lora_alpha": 128,
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 3,               # LoRA 收敛慢，给予更多轮次
-        "warmup_ratio": 0.05,
-    }),
-
-    # ==========================================================
-    # Exp4: LoRA LR Ablation (学习率消融实验)
-    # 目的: 仅仅改变 LR，看看 LoRA 效果不好是不是因为 LR 没给够。
-    # 论文点: "学习率对 PEFT 收敛速度的敏感性分析。"
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp4_LoRA64_lr3e4_wu05_5k_3ep",
-        "use_lora": True,
-        "dataset_size": 5000,
-        "learning_rate": 3e-4,         # 【变量】激进 LR
-        "lora_rank": 64,
-        "lora_alpha": 128,
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 3,
-        "warmup_ratio": 0.05,
-    }),
-
-    # ==========================================================
-    # Exp5: LoRA Warmup Ablation (预热消融实验)
-    # 目的: 仅仅改变 Warmup，测试硬启动的效果。
-    # 论文点: "Warmup 策略在小数据集微调中的必要性验证。"
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp5_LoRA64_lr1e4_wu00_5k_3ep",
-        "use_lora": True,
-        "dataset_size": 5000,
-        "learning_rate": 1e-4,
-        "lora_rank": 64,
-        "lora_alpha": 128,
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 3,
-        "warmup_ratio": 0.0,           # 【变量】无预热
-    }),
-
-    # ==========================================================
-    # Exp6: High Rank LoRA (高维 LoRA 探索)
-    # 目的: 大幅增加 Rank，看能否逼近 FFT (Exp1) 的效果。
-    # 论文点: "低秩假设验证：增加 Rank 带来的边际收益递减效应。"
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp6_LoRA256_lr1e4_wu05_5k_3ep",
-        "use_lora": True,
-        "dataset_size": 5000,
-        "learning_rate": 1e-4,
-        "lora_rank": 256,              # 【变量】极高 Rank
-        "lora_alpha": 512,
-        "batch_size": 16,              # Rank大显存高，降Batch
-        "grad_accumulation": auto_grad_accum(16), # 自动补齐 Accum=4 -> Global=64
-        "num_epochs": 3,
-        "warmup_ratio": 0.05,
-    }),
-
-    # ==========================================================
-    # Exp7: Final Production (15k 全量生产)
-    # 目的: 最终交付模型。基于 Exp1 的结论，采用 FFT。
-    # 注意: 数据量翻倍(15k)，保存频率必须提高。
-    # ==========================================================
-    dict(COMMON, **{
-        "run_name": "Exp7_Final_FFT_15k_1ep",
-        "use_lora": False,             # 选用最强的 FFT
-        "dataset_size": None,         # 全量数据
-        "learning_rate": 5e-4,         # 最佳参数
-        "batch_size": 32,
-        "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 1,               # 15k数据跑1轮足够
-        "warmup_ratio": 0.03,
-        # 15k数据约230步，设为50确保能存4-5个档位，防止最后一步崩盘
-        "save_steps": 50,              
-        "eval_steps": 50,
     }),
 ]
 

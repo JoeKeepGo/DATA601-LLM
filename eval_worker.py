@@ -1,8 +1,11 @@
-import torch
+import argparse
 import json
 import os
 import re
+import time
+
 import numpy as np
+import torch
 from tqdm import tqdm
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from transformers import (
@@ -12,36 +15,36 @@ from transformers import (
 )
 from peft import PeftModel
 
-# 全局配置 
+# 默认配置 (可被命令行参数覆盖)
 
 # "base" (纯基座), "lora" (基座+Adapter), "fft" (全量微调权重)
-MODE = "lora" 
+DEFAULT_MODE = "lora" 
 
 # 基座模型路径
-BASE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
+DEFAULT_BASE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
 
 # 检查点路径
 # lora 填 Adapter 文件夹路径
 # fft 填全量微调权重的文件夹
 # base 可忽略
-CHECKPOINT_PATH = "/home/data601/project/fine_tuned_model/lora_run_v1"
+DEFAULT_CHECKPOINT_PATH = "/home/data601/project/fine_tuned_model/lora_run_v1"
 
 # 测试集文件路径 
-TEST_FILE = "/home/data601/project/dataset/test/test.jsonl"
+DEFAULT_TEST_FILE = "/home/data601/project/dataset/test/test.jsonl"
 
 # 结果输出目录
-OUTPUT_DIR = "eval_results"
+DEFAULT_OUTPUT_DIR = "eval_results"
 
 # 评测数量控制
 # None: 评测所有数据
-NUM_SAMPLES = None
+DEFAULT_NUM_SAMPLES = None
 
 # 推理参数
-BATCH_SIZE = 16
-MAX_SEQ_LENGTH = 4096      
-MAX_NEW_TOKENS = 2048       
-LOAD_IN_4BIT = False
-SEED = 42                  
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_MAX_SEQ_LENGTH = 4096
+DEFAULT_MAX_NEW_TOKENS = 2048
+DEFAULT_LOAD_IN_4BIT = False
+DEFAULT_SEED = 42
 
 # Prompt 定义
 SCHEMA_DEFINITION = """
@@ -169,6 +172,29 @@ Impact Level Framework:
 }
 """
 
+# CLI 参数
+
+def _default_run_name(mode, checkpoint_path):
+    if checkpoint_path:
+        return os.path.basename(os.path.abspath(checkpoint_path.rstrip(os.sep)))
+    return mode
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluation worker")
+    parser.add_argument("--mode", type=str, choices=["base", "lora", "fft"], default=DEFAULT_MODE)
+    parser.add_argument("--base_model_path", type=str, default=DEFAULT_BASE_MODEL_PATH)
+    parser.add_argument("--checkpoint_path", type=str, default=DEFAULT_CHECKPOINT_PATH)
+    parser.add_argument("--test_file", type=str, default=DEFAULT_TEST_FILE)
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--num_samples", type=int, default=DEFAULT_NUM_SAMPLES)
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max_seq_length", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
+    parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--load_in_4bit", action="store_true", default=DEFAULT_LOAD_IN_4BIT)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    return parser.parse_args()
+
 # 工具函数
 
 def set_seed(seed):
@@ -243,97 +269,110 @@ def parse_sample(item):
 
 # 模型加载
 
-def load_model_and_tokenizer():
-    print(f"\n>>> Initializing in MODE: [{MODE}]")
-    
+def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bit):
+    print(f"\n>>> Initializing in MODE: [{mode}]")
+
     bnb_config = None
-    if LOAD_IN_4BIT:
+    if load_in_4bit:
         print(">>> Using 4-bit Quantization")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    
+
     # 加载 Tokenizer
-    tokenizer_path = BASE_MODEL_PATH if MODE != 'fft' else CHECKPOINT_PATH
+    tokenizer_path = base_model_path if mode != "fft" else checkpoint_path
     print(f">>> Loading Tokenizer from: {tokenizer_path}")
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     except:
         print("Warning: Failed to load tokenizer from checkpoint, using Base Model tokenizer.")
-        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
-        
-    tokenizer.padding_side = 'left' 
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         if tokenizer.eos_token:
             tokenizer.pad_token = tokenizer.eos_token
         else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     # 加载模型
     model = None
-    if MODE == 'base':
-        print(f">>> Loading BASE Model: {BASE_MODEL_PATH}")
+    if mode == "base":
+        print(f">>> Loading BASE Model: {base_model_path}")
         model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_PATH,
+            base_model_path,
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch_dtype,
         )
-    elif MODE == 'fft':
-        print(f">>> Loading FFT Model: {CHECKPOINT_PATH}")
-        if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
-             raise ValueError("MODE='fft' requires a valid CHECKPOINT_PATH!")
+    elif mode == "fft":
+        print(f">>> Loading FFT Model: {checkpoint_path}")
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            raise ValueError("MODE='fft' requires a valid CHECKPOINT_PATH!")
         model = AutoModelForCausalLM.from_pretrained(
-            CHECKPOINT_PATH,
+            checkpoint_path,
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch_dtype,
         )
-    elif MODE == 'lora':
-        print(f">>> Loading LoRA Base: {BASE_MODEL_PATH}")
+    elif mode == "lora":
+        print(f">>> Loading LoRA Base: {base_model_path}")
         base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_PATH,
+            base_model_path,
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch_dtype,
         )
-        print(f">>> Loading LoRA Adapter: {CHECKPOINT_PATH}")
-        if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
-             raise ValueError("MODE='lora' requires a valid CHECKPOINT_PATH!")
-        model = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
+        print(f">>> Loading LoRA Adapter: {checkpoint_path}")
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            raise ValueError("MODE='lora' requires a valid CHECKPOINT_PATH!")
+        model = PeftModel.from_pretrained(base_model, checkpoint_path)
     else:
-        raise ValueError(f"Unknown MODE: {MODE}")
-    
+        raise ValueError(f"Unknown MODE: {mode}")
+
     model.eval()
     return model, tokenizer
 
 # 主程序
 
-def main():
-    set_seed(SEED)
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+def run_evaluation(args):
+    set_seed(args.seed)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    run_name = args.run_name or _default_run_name(args.mode, args.checkpoint_path)
+    num_samples = args.num_samples
+    if num_samples is not None and num_samples <= 0:
+        num_samples = None
 
     # 加载数据
-    all_data = load_data(TEST_FILE)
-    
+    all_data = load_data(args.test_file)
+
     # 数据截取逻辑
-    if NUM_SAMPLES is not None and isinstance(NUM_SAMPLES, int):
-        print(f">>> [DEBUG MODE] Slicing first {NUM_SAMPLES} samples.")
-        test_data = all_data[:NUM_SAMPLES]
+    if num_samples is not None and isinstance(num_samples, int):
+        print(f">>> [DEBUG MODE] Slicing first {num_samples} samples.")
+        test_data = all_data[:num_samples]
     else:
         print(f">>> [FULL MODE] Using all {len(all_data)} samples.")
         test_data = all_data
-        
+
+    print(f"Run Name: {run_name}")
     print(f"Total Test Samples: {len(test_data)}")
 
     # 准备模型
-    model, tokenizer = load_model_and_tokenizer()
+    model, tokenizer = load_model_and_tokenizer(
+        args.mode,
+        args.base_model_path,
+        args.checkpoint_path,
+        args.load_in_4bit,
+    )
 
     # 推理循环
     results = []
@@ -341,121 +380,148 @@ def main():
     y_pred = []
     parse_errors = 0
 
-    print(f"\n>>> Starting Inference (Batch Size: {BATCH_SIZE})...")
-    
+    print(f"\n>>> Starting Inference (Batch Size: {args.batch_size})...")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     def batch_generator(data, bsize):
         for i in range(0, len(data), bsize):
-            yield data[i:i+bsize]
+            yield data[i:i + bsize]
 
-    total_batches = (len(test_data) + BATCH_SIZE - 1) // BATCH_SIZE
+    total_batches = (len(test_data) + args.batch_size - 1) // args.batch_size
+    start_time = time.time()
 
-    for batch in tqdm(batch_generator(test_data, BATCH_SIZE), total=total_batches):
-        
+    for batch in tqdm(batch_generator(test_data, args.batch_size), total=total_batches):
+
         # 批量解析输入与真值
         batch_inputs = []
         batch_gts = []
         batch_ids = []
-        
+
         for item in batch:
             txt, gt = parse_sample(item)
             batch_inputs.append(txt)
             batch_gts.append(gt)
-            batch_ids.append(item.get('id', 'unknown'))
-            
+            batch_ids.append(item.get("id", "unknown"))
+
         # 构造 Prompt
         prompts = [f"{SCHEMA_DEFINITION}\n\nUser: Analyze this: {txt}\nAssistant:" for txt in batch_inputs]
-        
+
         inputs = tokenizer(
-            prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=MAX_SEQ_LENGTH
-        ).to("cuda")
-        
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.max_seq_length,
+        ).to(device)
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False, # Greedy Search 保证确定性
-                pad_token_id=tokenizer.pad_token_id
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,  # Greedy Search 保证确定性
+                pad_token_id=tokenizer.pad_token_id,
             )
-        
+
         input_len = inputs.input_ids.shape[1]
         generated_tokens = outputs[:, input_len:]
         decoded_texts = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
         # 解析模型输出
         for i, text in enumerate(decoded_texts):
-            gt_level = batch_gts[i] # 获取对应的真值
-            
+            gt_level = batch_gts[i]  # 获取对应的真值
+
             pred_json = extract_json_from_text(text)
             pred_level = 1
             valid = False
 
             if pred_json:
                 try:
-                    p = int(pred_json.get('impact_level', 1))
+                    p = int(pred_json.get("impact_level", 1))
                     pred_level = max(1, min(5, p))
                     y_true.append(gt_level)
                     y_pred.append(pred_level)
                     valid = True
                 except:
                     pass
-            
+
             if not valid:
                 parse_errors += 1
-            
-            results.append({
-                "id": batch_ids[i],
-                "input_text": batch_inputs[i],
-                "ground_truth": gt_level,
-                "prediction": pred_level if valid else "ERROR",
-                "valid_json": valid,
-                "raw_response": text
-            })
+
+            results.append(
+                {
+                    "id": batch_ids[i],
+                    "input_text": batch_inputs[i],
+                    "ground_truth": gt_level,
+                    "prediction": pred_level if valid else "ERROR",
+                    "valid_json": valid,
+                    "raw_response": text,
+                }
+            )
+
+    elapsed = time.time() - start_time
 
     # 统计指标
-    metric_f1 = f1_score(y_true, y_pred, average='macro') if y_true else 0.0
+    metric_f1 = f1_score(y_true, y_pred, average="macro") if y_true else 0.0
     metric_acc = accuracy_score(y_true, y_pred) if y_true else 0.0
     format_rate = (len(test_data) - parse_errors) / len(test_data) if len(test_data) > 0 else 0
 
-    print("\n" + "="*40)
-    print(f"EVALUATION REPORT | Mode: {MODE}")
-    if NUM_SAMPLES: print(f"(Partial Evaluation: First {NUM_SAMPLES} samples)")
-    print("="*40)
+    print("\n" + "=" * 40)
+    print(f"EVALUATION REPORT | Run: {run_name} | Mode: {args.mode}")
+    if args.mode != "base":
+        print(f"Checkpoint: {args.checkpoint_path}")
+    if num_samples:
+        print(f"(Partial Evaluation: First {num_samples} samples)")
+    print("=" * 40)
     print(f"F1 Score (Macro): {metric_f1:.4f}")
     print(f"Accuracy:         {metric_acc:.4f}")
     print(f"Format Compliance: {format_rate:.2%}")
+    print(f"Parse Errors:     {parse_errors}")
+    print(f"Elapsed:          {elapsed:.2f}s")
     print("-" * 40)
 
     # 保存结果
-    run_name = f"{MODE}_results"
-    
+    predictions_path = os.path.join(args.output_dir, f"{run_name}_predictions.json")
+    metrics_path = os.path.join(args.output_dir, f"{run_name}_metrics.json")
+    class_report_path = os.path.join(args.output_dir, f"{run_name}_class_report.txt")
+
     # 保存详细预测
-    save_json(results, os.path.join(OUTPUT_DIR, f"{run_name}_predictions.json"))
-    
+    save_json(results, predictions_path)
+
     # 保存指标
     metrics = {
-        "mode": MODE,
-        "base_model": BASE_MODEL_PATH,
-        "checkpoint": CHECKPOINT_PATH,
+        "run_name": run_name,
+        "mode": args.mode,
+        "base_model": args.base_model_path,
+        "checkpoint": args.checkpoint_path,
+        "test_file": args.test_file,
         "num_samples": len(test_data),
         "f1": metric_f1,
         "acc": metric_acc,
-        "format_rate": format_rate
+        "format_rate": format_rate,
+        "parse_errors": parse_errors,
+        "batch_size": args.batch_size,
+        "max_seq_length": args.max_seq_length,
+        "max_new_tokens": args.max_new_tokens,
+        "load_in_4bit": args.load_in_4bit,
+        "seed": args.seed,
+        "elapsed_seconds": elapsed,
     }
-    save_json(metrics, os.path.join(OUTPUT_DIR, f"{run_name}_metrics.json"))
+    save_json(metrics, metrics_path)
 
     # 保存分类报告
     if y_true:
-        report = classification_report(y_true, y_pred, labels=[1,2,3,4,5], zero_division=0)
-        with open(os.path.join(OUTPUT_DIR, f"{run_name}_class_report.txt"), "w") as f:
+        report = classification_report(y_true, y_pred, labels=[1, 2, 3, 4, 5], zero_division=0)
+        with open(class_report_path, "w") as f:
             f.write(report)
         print("Classification Report saved.")
         print(report)
 
-    print(f"\nAll Done. Results saved to: {OUTPUT_DIR}")
+    print(f"\nAll Done. Results saved to: {args.output_dir}")
+
+def main():
+    args = parse_args()
+    run_evaluation(args)
 
 if __name__ == "__main__":
     main()
