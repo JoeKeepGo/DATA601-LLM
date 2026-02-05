@@ -23,12 +23,14 @@ COMMON = {
     "base_model_path": "Qwen/Qwen3-4B-Instruct-2507",
     "test_file": "/home/data601/project/dataset/test/test.jsonl",
     "output_dir": "/home/data601/project/eval_results",
-    "num_samples": None,
-    "batch_size": 16,
-    "max_seq_length": 4096,
-    "max_new_tokens": 2048,
+    "num_samples": 500,
+    "sample_strategy": "random",
+    "batch_size": 64,
+    "max_seq_length": 2048 ,
+    "max_new_tokens": 1400,
     "load_in_4bit": False,
     "seed": 42,
+    "stop_on_json": True,
 }
 
 MODEL_ROOT = "/home/data601/project/fine_tuned_model"
@@ -46,49 +48,9 @@ MANUAL_EXPERIMENTS = [
     dict(
         COMMON,
         **{
-            "run_name": "Exp1_FFT_Benchmark_5k_1ep",
-            "mode": "fft",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp1_FFT_Benchmark_5k_1ep"),
-        },
-    ),
-    dict(
-        COMMON,
-        **{
-            "run_name": "Exp2_FFT_Overfit_5k_2ep_Retest",
-            "mode": "fft",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp2_FFT_Overfit_5k_2ep_Retest"),
-        },
-    ),
-    dict(
-        COMMON,
-        **{
-            "run_name": "Exp3_LoRA64_base_lr1e4_wu05_5k_3ep",
+            "run_name": "Exp7_Final_LoRA_15k_LowLR",
             "mode": "lora",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp3_LoRA64_base_lr1e4_wu05_5k_3ep"),
-        },
-    ),
-    dict(
-        COMMON,
-        **{
-            "run_name": "Exp4_LoRA64_lr3e4_wu05_5k_3ep",
-            "mode": "lora",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp4_LoRA64_lr3e4_wu05_5k_3ep"),
-        },
-    ),
-    dict(
-        COMMON,
-        **{
-            "run_name": "Exp5_LoRA64_lr1e4_wu00_5k_3ep",
-            "mode": "lora",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp5_LoRA64_lr1e4_wu00_5k_3ep"),
-        },
-    ),
-    dict(
-        COMMON,
-        **{
-            "run_name": "Exp6_LoRA256_lr1e4_wu05_5k_3ep",
-            "mode": "lora",
-            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp6_LoRA256_lr1e4_wu05_5k_3ep"),
+            "checkpoint_path": os.path.join(MODEL_ROOT, "Exp7_Final_LoRA_15k_LowLR"),
         },
     ),
 ]
@@ -343,11 +305,16 @@ def run_evaluations():
             _add_arg(cmd, "--test_file", exp.get("test_file"))
             _add_arg(cmd, "--output_dir", exp.get("output_dir"))
             _add_arg(cmd, "--num_samples", exp.get("num_samples"))
+            _add_arg(cmd, "--sample_strategy", exp.get("sample_strategy"))
             _add_arg(cmd, "--batch_size", exp.get("batch_size"))
             _add_arg(cmd, "--max_seq_length", exp.get("max_seq_length"))
             _add_arg(cmd, "--max_new_tokens", exp.get("max_new_tokens"))
             _add_arg(cmd, "--seed", exp.get("seed"))
             _add_flag(cmd, "--load_in_4bit", exp.get("load_in_4bit", False))
+            if exp.get("stop_on_json", True):
+                cmd.append("--stop_on_json")
+            else:
+                cmd.append("--no_stop_on_json")
 
             log_view.append(f"Evaluation [{i}/{total}]: {exp['run_name']}")
             log_view.append(f"Config: {exp}")

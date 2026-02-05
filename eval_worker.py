@@ -9,9 +9,10 @@ import torch
 from tqdm import tqdm
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
-    BitsAndBytesConfig
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    GenerationConfig,
 )
 from peft import PeftModel
 
@@ -45,6 +46,10 @@ DEFAULT_MAX_SEQ_LENGTH = 4096
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_LOAD_IN_4BIT = False
 DEFAULT_SEED = 42
+DEFAULT_FIX_MISTRAL_REGEX = True
+DEFAULT_SAMPLE_STRATEGY = "first"
+DEFAULT_STOP_ON_JSON = True
+DEFAULT_STOP_STRINGS = ["\n}\n```", "}\n```"]
 
 # Prompt 定义
 SCHEMA_DEFINITION = """
@@ -193,6 +198,17 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--load_in_4bit", action="store_true", default=DEFAULT_LOAD_IN_4BIT)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--fix_mistral_regex", action="store_true", default=DEFAULT_FIX_MISTRAL_REGEX)
+    parser.add_argument("--no_fix_mistral_regex", action="store_false", dest="fix_mistral_regex")
+    parser.add_argument(
+        "--sample_strategy",
+        type=str,
+        choices=["first", "random"],
+        default=DEFAULT_SAMPLE_STRATEGY,
+        help="How to pick samples when num_samples is set.",
+    )
+    parser.add_argument("--stop_on_json", action="store_true", default=DEFAULT_STOP_ON_JSON)
+    parser.add_argument("--no_stop_on_json", action="store_false", dest="stop_on_json")
     return parser.parse_args()
 
 # 工具函数
@@ -269,7 +285,7 @@ def parse_sample(item):
 
 # 模型加载
 
-def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bit):
+def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bit, fix_mistral_regex):
     print(f"\n>>> Initializing in MODE: [{mode}]")
 
     bnb_config = None
@@ -285,10 +301,18 @@ def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bi
     tokenizer_path = base_model_path if mode != "fft" else checkpoint_path
     print(f">>> Loading Tokenizer from: {tokenizer_path}")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            fix_mistral_regex=fix_mistral_regex,
+        )
     except:
         print("Warning: Failed to load tokenizer from checkpoint, using Base Model tokenizer.")
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model_path,
+            trust_remote_code=True,
+            fix_mistral_regex=fix_mistral_regex,
+        )
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
@@ -308,7 +332,7 @@ def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bi
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
         )
     elif mode == "fft":
         print(f">>> Loading FFT Model: {checkpoint_path}")
@@ -319,7 +343,7 @@ def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bi
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
         )
     elif mode == "lora":
         print(f">>> Loading LoRA Base: {base_model_path}")
@@ -328,7 +352,7 @@ def load_model_and_tokenizer(mode, base_model_path, checkpoint_path, load_in_4bi
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
         )
         print(f">>> Loading LoRA Adapter: {checkpoint_path}")
         if not checkpoint_path or not os.path.exists(checkpoint_path):
@@ -351,14 +375,24 @@ def run_evaluation(args):
     num_samples = args.num_samples
     if num_samples is not None and num_samples <= 0:
         num_samples = None
+    sample_strategy = args.sample_strategy
 
     # 加载数据
     all_data = load_data(args.test_file)
 
     # 数据截取逻辑
     if num_samples is not None and isinstance(num_samples, int):
-        print(f">>> [DEBUG MODE] Slicing first {num_samples} samples.")
-        test_data = all_data[:num_samples]
+        if num_samples >= len(all_data):
+            print(f">>> [FULL MODE] Using all {len(all_data)} samples.")
+            test_data = all_data
+        elif sample_strategy == "random":
+            rng = np.random.RandomState(args.seed)
+            indices = rng.permutation(len(all_data))[:num_samples]
+            test_data = [all_data[i] for i in indices]
+            print(f">>> [DEBUG MODE] Randomly sampling {num_samples} samples (seed={args.seed}).")
+        else:
+            print(f">>> [DEBUG MODE] Slicing first {num_samples} samples.")
+            test_data = all_data[:num_samples]
     else:
         print(f">>> [FULL MODE] Using all {len(all_data)} samples.")
         test_data = all_data
@@ -372,6 +406,7 @@ def run_evaluation(args):
         args.base_model_path,
         args.checkpoint_path,
         args.load_in_4bit,
+        args.fix_mistral_regex,
     )
 
     # 推理循环
@@ -390,6 +425,19 @@ def run_evaluation(args):
 
     total_batches = (len(test_data) + args.batch_size - 1) // args.batch_size
     start_time = time.time()
+
+    generation_config = model.generation_config
+    if generation_config is None:
+        generation_config = GenerationConfig.from_model_config(model.config)
+    else:
+        generation_config = GenerationConfig.from_dict(generation_config.to_dict())
+    generation_config.do_sample = False
+    generation_config.temperature = 1.0
+    generation_config.top_p = 1.0
+    generation_config.top_k = 50
+    generation_config.pad_token_id = tokenizer.pad_token_id
+    generation_config.max_new_tokens = args.max_new_tokens
+    generation_config.stop_strings = DEFAULT_STOP_STRINGS if args.stop_on_json else None
 
     for batch in tqdm(batch_generator(test_data, args.batch_size), total=total_batches):
 
@@ -418,9 +466,8 @@ def run_evaluation(args):
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,  # Greedy Search 保证确定性
-                pad_token_id=tokenizer.pad_token_id,
+                generation_config=generation_config,
+                tokenizer=tokenizer,
             )
 
         input_len = inputs.input_ids.shape[1]
@@ -471,7 +518,10 @@ def run_evaluation(args):
     if args.mode != "base":
         print(f"Checkpoint: {args.checkpoint_path}")
     if num_samples:
-        print(f"(Partial Evaluation: First {num_samples} samples)")
+        if sample_strategy == "random":
+            print(f"(Partial Evaluation: Random {num_samples} samples, seed={args.seed})")
+        else:
+            print(f"(Partial Evaluation: First {num_samples} samples)")
     print("=" * 40)
     print(f"F1 Score (Macro): {metric_f1:.4f}")
     print(f"Accuracy:         {metric_acc:.4f}")
@@ -496,6 +546,8 @@ def run_evaluation(args):
         "checkpoint": args.checkpoint_path,
         "test_file": args.test_file,
         "num_samples": len(test_data),
+        "requested_num_samples": args.num_samples,
+        "sample_strategy": sample_strategy,
         "f1": metric_f1,
         "acc": metric_acc,
         "format_rate": format_rate,
@@ -505,6 +557,8 @@ def run_evaluation(args):
         "max_new_tokens": args.max_new_tokens,
         "load_in_4bit": args.load_in_4bit,
         "seed": args.seed,
+        "stop_on_json": args.stop_on_json,
+        "stop_strings": DEFAULT_STOP_STRINGS if args.stop_on_json else None,
         "elapsed_seconds": elapsed,
     }
     save_json(metrics, metrics_path)

@@ -65,21 +65,26 @@ COMMON = {
 # 实验组菜单
 experiments = [
     # ==========================================================
-    # Exp2: FFT Overfit Boundary (过拟合边界探测)
-    # 目的: 故意多跑一轮。如果第2轮 Loss 变高，证明 Exp1 的 Early Stopping 是完美的。
-    # 论文点: "验证了 5k 数据量下，1 Epoch 是泛化能力的拐点。"
+    # Exp7: Final Production (15k 全量生产 - 修正版)
+    # 依据: 
+    #   1. Exp1/2 证明 FFT 高 LR 必死 (F1 0.00)，必须放弃 FFT 或用极低 LR。
+    #   2. Exp3 证明 LoRA 有效 (F1 0.65)，但 Exp4 证明 3e-4 太大。
+    #   3. 只有 "低 LR (5e-5) + 增加轮数" 才能在保护逻辑的同时优化格式。
     # ==========================================================
     dict(COMMON, **{
-        "run_name": "Exp2_FFT_Overfit_5k_2ep_Retest",
-        "use_lora": False,
-        "dataset_size": 5000,
-        "learning_rate": 5e-4,
+        "run_name": "Exp7_Final_LoRA_15k_LowLR",
+        "use_lora": True,              # FFT 风险太大
+        "dataset_size": None,          # 全量
+        "learning_rate": 5e-5,         # 比 Exp3(1e-4) 还要低，为了稳住格式
+        "lora_rank": 64,               # Exp6 证明 256 没用，回到 64
+        "lora_alpha": 128,
         "batch_size": 32,
         "grad_accumulation": auto_grad_accum(32),
-        "num_epochs": 2,               # 【变量】增加轮数
-        "save_steps": 100,      # 按 Epoch 保存，方便直接对比 Ep1 vs Ep2
-        "eval_steps": 10,
-        "load_best_model_at_end": True,
+        # 低 LR 需要更多步数来收敛。
+        "num_epochs": 3,               
+        "warmup_ratio": 0.05,          # Exp5 证明 Warmup 必须要有
+        "save_steps": 100,             
+        "eval_steps": 50,
     }),
 ]
 
